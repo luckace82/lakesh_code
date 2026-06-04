@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""
+Lakesh — your local AI assistant. Optimised version.
+Usage:
+  lakesh                     interactive session
+  lakesh "fix the auth bug"  single task
+"""
+
+import sys, os, json, subprocess, argparse, readline
+from pathlib import Path
+from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
+
+try:
+    import ollama
+    from rich.console import Console
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+    from rich.prompt import Prompt
+    from rich.live import Live
+    from rich.text import Text
+except ImportError:
+    print("Missing deps. Run: pip install ollama rich python-dotenv")
+    sys.exit(1)
+
+console = Console()
+
+MODEL        = os.environ.get("LAKESH_MODEL", "qwen3-coder:30b")
+MODE         = os.environ.get("LAKESH_MODE", "agent")  # "agent" or "chat"
+AGENT_NAME   = os.environ.get("LAKESH_AGENT_NAME", "Lakesh")
+MEMORY_FILE  = ".lakesh_memory.json"
+HISTORY_FILE = os.path.expanduser("~/.lakesh_history")
+MAX_STEPS    = int(os.environ.get("LAKESH_MAX_STEPS", "50"))
+
+CHAT_SYSTEM_PROMPT = f"""You are {AGENT_NAME}, a friendly and knowledgeable local AI coding assistant.
+You are concise and direct. For conversational messages, greetings, simple questions,
+or anything that does NOT require reading files or running commands — just answer directly.
+Do NOT use any tools unless the user explicitly asks you to look at files or run something.
+Format code with markdown code blocks when relevant."""
+
+AGENT_SYSTEM_PROMPT = f"""You are {AGENT_NAME}, a senior software engineer AI assistant with direct access to the filesystem.
+
+CRITICAL RULES — follow these exactly:
+1. NEVER ask the user to paste or share file contents. You have read_file — use it.
+2. If the user mentions a filename (e.g. server.py), ALWAYS call read_file on it immediately.
+3. If you don't know the exact path, call list_dir first to find it, then read_file.
+4. Only after reading the file should you analyse or respond about it.
+
+When you need a tool, respond with EXACTLY this on one line (nothing else on that line):
+TOOL_CALL: {"name": "tool_name", "args": {"arg1": "value1"}}
+
+Available tools:
+- read_file(path) — read any file on disk
+- list_dir(path) — list files in a directory (use "." for current directory)
+- write_file(path, content) — write or edit a file
+- run_command(cmd) — run a shell command and get output
+- search_code(query) — semantic search across the indexed codebase
+- memory_get(key) — recall a saved note
+- memory_set(key, value) — save a note for later
+
+Workflow for file tasks:
+  User: "analyze server.py"
+  You:  TOOL_CALL: {"name": "list_dir", "args": {"path": "."}}
+  [get result, find server.py path]
+  You:  TOOL_CALL: {"name": "read_file", "args": {"path": "./server.py"}}
+  [read it, then give full analysis in markdown]
+
+Give final answers in clear markdown with code blocks where relevant."""
+
+import re as _re
+
+CHAT_ONLY = {
+    "hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "sure",
+    "good morning", "good evening", "bye", "goodbye", "yes", "no", "yep", "nope"
+}
+
+AGENT_KEYWORDS = {
+    "analyze", "analyse", "review", "check", "inspect", "look at", "open",
+    "read", "show", "print", "display", "summarize", "summarise",
+    "file", "folder", "directory", ".py", ".js", ".ts", ".html", ".css",
+    ".json", ".yaml", ".yml", ".toml", ".sh", ".md", ".txt", ".env",
+    "server", "views", "models", "urls", "settings", "config", "main",
+    "fix", "edit", "write", "create", "refactor", "debug", "improve",
+    "optimise", "optimize", "rewrite", "add", "remove", "update", "change",
+    "find", "search", "where", "which", "list", "scan", "index",
+    "function", "class", "method", "import", "module", "package",
+    "run", "execute", "test", "install", "start", "stop", "restart",
+    "error", "bug", "broken", "failing", "crash", "exception", "traceback",
+    "project", "repo", "codebase", "database", "migration", "git", "commit",
+    "route", "endpoint", "api", "url", "view", "model", "controller",
+}
+
+def needs_agent(task: str) -> bool:
+    """Return True if this task likely needs file/code tools."""
+    if MODE == "chat":
+        return False
+
+    low = task.lower().strip()
+
+    if low in CHAT_ONLY or any(low == k for k in CHAT_ONLY):
+        return False
+
+    if _re.search(r'\b\w+\.\w{1,5}\b', low):
+        return True
+
+    if any(k in low for k in AGENT_KEYWORDS):
+        return True
+
+    return False
+
+
+
+def read_file(path: str) -> str:
+    try:
+        content = Path(path).read_text(errors="ignore")
+        if len(content) > 6000:
+            content = content[:6000] + "\n\n[... truncated ...]"
+        return content
+    except Exception as e:
+        return f"Error reading {path}: {e}"
+
+def list_dir(path: str = ".") -> str:
+    try:
+        entries = sorted(Path(path).iterdir(), key=lambda e: (e.is_file(), e.name))
+        return "\n".join(f"{e.name}{'/' if e.is_dir() else ''}" for e in entries)
+    except Exception as e:
+        return f"Error: {e}"
+
+def write_file(path: str, content: str) -> str:
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(content)
+        return f"Written: {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+def run_command(cmd: str) -> str:
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True,
+            text=True, timeout=30, cwd=os.getcwd()
+        )
+        out = (result.stdout + result.stderr).strip()
+        return out[:2000] if out else "(no output)"
+    except subprocess.TimeoutExpired:
+        return "Timed out after 30s"
+    except Exception as e:
+        return f"Error: {e}"
+
+def search_code(query: str) -> str:
+    try:
+        import chromadb
+        client = chromadb.PersistentClient(path=".chroma")
+        col = client.get_collection("codebase")
+        emb = ollama.embeddings(model="nomic-embed-text", prompt=query)["embedding"]
+        results = col.query(query_embeddings=[emb], n_results=4)
+        out = []
+        for fid, doc in zip(results["ids"][0], results["documents"][0]):
+            out.append(f"{fid}:\n{doc[:400]}")
+        return "\n\n---\n".join(out)
+    except Exception as e:
+        return f"Search unavailable: {e}"
+
+def memory_get(key: str) -> str:
+    mem = _load_memory()
+    return mem.get(key, {}).get("value", f"No memory for: {key}")
+
+def memory_set(key: str, value: str) -> str:
+    mem = _load_memory()
+    mem[key] = {"value": value, "saved": datetime.now().isoformat()}
+    _save_memory(mem)
+    return f"Remembered: {key}"
+
+def _load_memory():
+    if Path(MEMORY_FILE).exists():
+        try:
+            return json.loads(Path(MEMORY_FILE).read_text())
+        except:
+            return {}
+    return {}
+
+def _save_memory(data):
+    Path(MEMORY_FILE).write_text(json.dumps(data, indent=2))
+
+TOOLS = {
+    "read_file": read_file,
+    "list_dir": list_dir,
+    "write_file": write_file,
+    "run_command": run_command,
+    "search_code": search_code,
+    "memory_get": memory_get,
+    "memory_set": memory_set,
+}
+
+
+
+def chat_fast(task: str, history: list) -> str:
+    """Direct model call — no tool loop, streams tokens immediately."""
+    messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+    messages += history[-10:]
+    messages.append({"role": "user", "content": task})
+
+    full = ""
+    console.print()
+    with Live(console=console, refresh_per_second=20) as live:
+        for chunk in ollama.chat(model=MODEL, messages=messages, stream=True):
+            token = chunk["message"]["content"]
+            full += token
+            live.update(Text(full, style="white"))
+    return full
+
+
+
+def parse_tool_call(text: str):
+    for line in text.split("\n"):
+        line = line.strip()
+        if line.startswith("TOOL_CALL:"):
+            try:
+                return json.loads(line[len("TOOL_CALL:"):].strip())
+            except:
+                pass
+    return None
+
+def run_agent(task: str, history: list) -> str:
+    """Full agent loop — only called when tools are actually needed."""
+    messages = [{"role": "system", "content": AGENT_SYSTEM_PROMPT}]
+    messages += history[-10:]
+    messages.append({"role": "user", "content": task})
+
+    for step in range(MAX_STEPS):
+        full_response = ""
+        console.print()
+        with Live(console=console, refresh_per_second=20) as live:
+            for chunk in ollama.chat(model=MODEL, messages=messages, stream=True):
+                token = chunk["message"]["content"]
+                full_response += token
+                display = "\n".join(
+                    l for l in full_response.split("\n")
+                    if not l.strip().startswith("TOOL_CALL:")
+                )
+                live.update(Text(display.strip(), style="white"))
+
+        messages.append({"role": "assistant", "content": full_response})
+
+        tool_call = parse_tool_call(full_response)
+        if not tool_call:
+            return full_response
+
+        name = tool_call.get("name", "")
+        args = tool_call.get("args", {})
+
+        console.print(f"\n[dim cyan]  ⚙ {name}({', '.join(f'{k}={repr(v)[:50]}' for k,v in args.items())})[/dim cyan]")
+
+        result = TOOLS[name](**args) if name in TOOLS else f"Unknown tool: {name}"
+
+        if len(str(result)) > 200:
+            console.print(Panel(
+                result[:2000] + ("..." if len(result) > 2000 else ""),
+                title=f"[dim cyan]{name} result[/dim cyan]",
+                border_style="dim cyan",
+                padding=(0, 1)
+            ))
+        else:
+            console.print(f"[dim]    ✓ {result}[/dim]")
+
+        messages.append({"role": "user", "content": f"Tool result:\n{result}"})
+
+    return "Reached max steps."
+
+
+
+def respond(task: str, history: list) -> str:
+    if needs_agent(task):
+        console.print("[dim]  → searching codebase...[/dim]" if "search" in task.lower() else "")
+        return run_agent(task, history)
+    return chat_fast(task, history)
+
+
+
+def interactive_session():
+    if Path(HISTORY_FILE).exists():
+        try:
+            readline.read_history_file(HISTORY_FILE)
+        except:
+            pass
+
+    history = []
+    cwd = os.getcwd()
+
+    console.print(Panel.fit(
+        f"[bold blue]Lakesh[/bold blue]  —  local AI assistant\n"
+        f"[dim]Model: {MODEL}  ·  Project: {Path(cwd).name}  ·  GPU: NVIDIA[/dim]\n"
+        f"[dim]Talk naturally. 'clear' resets context. 'exit' to quit.[/dim]",
+        border_style="blue"
+    ))
+
+    while True:
+        try:
+            console.print()
+            user_input = Prompt.ask("[bold blue]lakesh[/bold blue]").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[dim]Goodbye.[/dim]")
+            try:
+                readline.write_history_file(HISTORY_FILE)
+            except:
+                pass
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.lower() in ("exit", "quit", "bye"):
+            console.print("[dim]Goodbye.[/dim]")
+            break
+
+        if user_input.lower() == "clear":
+            history = []
+            console.clear()
+            console.print("[dim]Context cleared.[/dim]")
+            continue
+
+        if user_input.lower() == "memory":
+            mem = _load_memory()
+            if mem:
+                for k, v in mem.items():
+                    console.print(f"[bold]{k}:[/bold] {v.get('value','')}")
+            else:
+                console.print("[dim]No memories yet.[/dim]")
+            continue
+
+        if user_input.lower().startswith("cd "):
+            try:
+                os.chdir(user_input[3:].strip())
+                console.print(f"[dim]→ {os.getcwd()}[/dim]")
+            except Exception as e:
+                console.print(f"[red]{e}[/red]")
+            continue
+
+        response = respond(user_input, history)
+
+        history.append({"role": "user", "content": user_input})
+        history.append({"role": "assistant", "content": response})
+        history = history[-20:]
+
+        if any(c in response for c in ["```", "**", "\n#", "\n-", "\n1."]):
+            console.print()
+            console.print(Markdown(response))
+
+
+def single_task(task: str):
+    console.print(f"[dim]lakesh → {task}[/dim]")
+    response = respond(task, [])
+    if any(c in response for c in ["```", "**", "\n#", "\n-"]):
+        console.print()
+        console.print(Markdown(response))
+    console.print()
+
+
+
+def main():
+    global MODEL
+    parser = argparse.ArgumentParser(prog="lakesh")
+    parser.add_argument("task", nargs="*")
+    parser.add_argument("--model", default=MODEL)
+    args = parser.parse_args()
+
+    MODEL = args.model
+
+    if args.task:
+        single_task(" ".join(args.task))
+    else:
+        interactive_session()
+
+if __name__ == "__main__":
+    main()

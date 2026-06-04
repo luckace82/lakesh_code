@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Code Architecture Graph</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600&family=Syne:wght@400;700;800&display=swap');
+
+  :root {
+    --bg:        #0a0a0f;
+    --surface:   #111118;
+    --border:    #1e1e2e;
+    --text:      #cdd6f4;
+    --muted:     #585b70;
+    --accent:    #cba6f7;
+
+    --module:    #89b4fa;   /* blue */
+    --class:     #a6e3a1;   /* green */
+    --function:  #fab387;   /* peach */
+
+    --calls:     #f38ba8;   /* red */
+    --inherits:  #a6e3a1;   /* green */
+    --imports:   #89b4fa;   /* blue */
+    --contains:  #313244;   /* dim */
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── Header ───────────────────────────────────── */
+  header {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    padding: .75rem 1.5rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+    flex-wrap: wrap;
+  }
+
+  .logo {
+    font-family: 'Syne', sans-serif;
+    font-weight: 800;
+    font-size: 1.1rem;
+    letter-spacing: -.02em;
+    color: var(--accent);
+    white-space: nowrap;
+  }
+
+  .path-input {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+    flex: 1;
+    min-width: 200px;
+  }
+
+  .path-input label { color: var(--muted); font-size: .7rem; white-space: nowrap; }
+
+  .path-input input {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: inherit;
+    font-size: .75rem;
+    padding: .35rem .6rem;
+    border-radius: 4px;
+    outline: none;
+    transition: border-color .2s;
+  }
+  .path-input input:focus { border-color: var(--accent); }
+
+  button {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: .72rem;
+    padding: .35rem .8rem;
+    border-radius: 4px;
+    border: 1px solid var(--accent);
+    background: transparent;
+    color: var(--accent);
+    cursor: pointer;
+    transition: background .15s, color .15s;
+    white-space: nowrap;
+  }
+  button:hover { background: var(--accent); color: var(--bg); }
+  button:disabled { opacity: .4; cursor: default; }
+  button.active { background: var(--accent); color: var(--bg); }
+
+  /* ── Filters ──────────────────────────────────── */
+  .filters {
+    display: flex;
+    align-items: center;
+    gap: .4rem;
+    flex-wrap: wrap;
+  }
+
+  .filters label { color: var(--muted); font-size: .65rem; }
+
+  .pill {
+    font-size: .65rem;
+    padding: .25rem .6rem;
+    border-radius: 99px;
+    border: 1px solid;
+    cursor: pointer;
+    transition: opacity .15s;
+  }
+  .pill.off { opacity: .25; }
+
+  .pill-module   { border-color: var(--module);   color: var(--module); }
+  .pill-class    { border-color: var(--class);    color: var(--class); }
+  .pill-function { border-color: var(--function); color: var(--function); }
+  .pill-calls    { border-color: var(--calls);    color: var(--calls); }
+  .pill-inherits { border-color: var(--inherits); color: var(--inherits); }
+  .pill-imports  { border-color: var(--imports);  color: var(--imports); }
+  .pill-contains { border-color: var(--muted);    color: var(--muted); }
+
+  /* ── Canvas ───────────────────────────────────── */
+  #canvas {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+  }
+
+  svg {
+    width: 100%;
+    height: 100%;
+  }
+
+  /* ── Nodes ────────────────────────────────────── */
+  .node circle {
+    stroke-width: 1.5;
+    transition: r .2s;
+    cursor: pointer;
+  }
+  .node:hover circle { filter: brightness(1.3); }
+
+  .node text {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    fill: var(--text);
+    pointer-events: none;
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+
+  /* ── Links ────────────────────────────────────── */
+  .link {
+    stroke-opacity: .55;
+    stroke-width: 1;
+    fill: none;
+  }
+  .link.hidden { display: none; }
+
+  /* ── Info panel ───────────────────────────────── */
+  #info {
+    position: absolute;
+    right: 1rem;
+    top: 1rem;
+    width: 280px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    font-size: .72rem;
+    display: none;
+    animation: fadeIn .15s ease;
+    max-height: 60vh;
+    overflow-y: auto;
+  }
+  #info.visible { display: block; }
+
+  @keyframes fadeIn { from { opacity:0; transform: translateY(4px); } }
+
+  #info h3 {
+    font-family: 'Syne', sans-serif;
+    font-size: .85rem;
+    font-weight: 700;
+    color: var(--accent);
+    margin-bottom: .6rem;
+    word-break: break-all;
+  }
+  #info .row { display: flex; gap: .5rem; margin-bottom: .3rem; }
+  #info .key { color: var(--muted); min-width: 70px; }
+  #info .val { color: var(--text); word-break: break-all; }
+  #info .section { margin-top: .7rem; color: var(--muted); font-size: .65rem; text-transform: uppercase; letter-spacing: .08em; }
+  #info ul { list-style: none; margin-top: .3rem; }
+  #info li { padding: .15rem 0; color: var(--text); border-bottom: 1px solid var(--border); }
+  #info li:last-child { border: none; }
+
+  #info-close {
+    position: absolute;
+    top: .5rem; right: .6rem;
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-size: 1rem;
+    cursor: pointer;
+    padding: 0;
+    line-height: 1;
+  }
+  #info-close:hover { color: var(--text); background: none; }
+
+  /* ── Status bar ───────────────────────────────── */
+  #status {
+    position: absolute;
+    bottom: 1rem;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 99px;
+    padding: .35rem 1rem;
+    font-size: .65rem;
+    color: var(--muted);
+    pointer-events: none;
+    transition: opacity .3s;
+  }
+
+  /* ── Stats ────────────────────────────────────── */
+  #stats {
+    position: absolute;
+    bottom: 1rem;
+    left: 1rem;
+    font-size: .65rem;
+    color: var(--muted);
+    line-height: 1.6;
+  }
+
+  /* ── Loading ──────────────────────────────────── */
+  #loading {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg);
+    font-size: .8rem;
+    color: var(--muted);
+    letter-spacing: .1em;
+  }
+  #loading.hidden { display: none; }
+
+  .spinner {
+    width: 20px; height: 20px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+    margin-right: .75rem;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">⬡ codegrapher</div>
+
+  <div class="path-input">
+    <label>PATH</label>
+    <input id="path-input" type="text" value="." placeholder="./your/project or file.py" />
+    <button id="load-btn">analyze</button>
+  </div>
+
+  <div class="filters">
+    <label>nodes</label>
+    <span class="pill pill-module"   data-filter="node-module">module</span>
+    <span class="pill pill-class"    data-filter="node-class">class</span>
+    <span class="pill pill-function" data-filter="node-function">function</span>
+    <label style="margin-left:.4rem">edges</label>
+    <span class="pill pill-calls"    data-filter="edge-calls">calls</span>
+    <span class="pill pill-inherits" data-filter="edge-inherits">inherits</span>
+    <span class="pill pill-imports"  data-filter="edge-imports">imports</span>
+    <span class="pill pill-contains" data-filter="edge-contains">contains</span>
+  </div>
+
+  <button id="export-btn" disabled>export PNG</button>
+</header>
+
+<div id="canvas">
+  <div id="loading"><div class="spinner"></div> analyzing…</div>
+  <svg id="svg"></svg>
+  <div id="info">
+    <button id="info-close">✕</button>
+    <h3 id="info-title"></h3>
+    <div id="info-body"></div>
+  </div>
+  <div id="stats"></div>
+  <div id="status">scroll to zoom · drag to pan · click node to inspect</div>
+</div>
+
+<script>
+const API = 'http://127.0.0.1:3000';
+
+// ── State ──────────────────────────────────────────────────────────
+const visible = {
+  'node-module': true, 'node-class': true, 'node-function': true,
+  'edge-calls': true,  'edge-inherits': true, 'edge-imports': true, 'edge-contains': true,
+};
+
+let graphData = null;
+let simulation  = null;
+
+// ── Color maps ─────────────────────────────────────────────────────
+const nodeColor = { module: '#89b4fa', class: '#a6e3a1', function: '#fab387' };
+const edgeColor = { calls: '#f38ba8', inherits: '#a6e3a1', imports: '#89b4fa', contains: '#313244' };
+const nodeRadius = { module: 10, class: 8, function: 5 };
+
+// ── DOM refs ───────────────────────────────────────────────────────
+const svg        = d3.select('#svg');
+const loadingEl  = document.getElementById('loading');
+const statusEl   = document.getElementById('status');
+const statsEl    = document.getElementById('stats');
+const infoEl     = document.getElementById('info');
+const infoTitle  = document.getElementById('info-title');
+const infoBody   = document.getElementById('info-body');
+const exportBtn  = document.getElementById('export-btn');
+const loadBtn    = document.getElementById('load-btn');
+const pathInput  = document.getElementById('path-input');
+
+// ── Fetch & render ─────────────────────────────────────────────────
+async function loadGraph() {
+  const path = pathInput.value.trim() || '.';
+  loadingEl.classList.remove('hidden');
+  svg.selectAll('*').remove();
+  exportBtn.disabled = true;
+  loadBtn.disabled = true;
+  setStatus('fetching graph from API…');
+
+  try {
+    const res = await fetch(`${API}/graph?path=${encodeURIComponent(path)}`);
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.detail || res.statusText);
+    }
+    graphData = await res.json();
+    setStatus(`loaded ${graphData.nodes.length} nodes · ${graphData.edges.length} edges`);
+    renderGraph(graphData);
+    updateStats(graphData);
+    exportBtn.disabled = false;
+  } catch (e) {
+    setStatus(`error: ${e.message}`);
+  } finally {
+    loadingEl.classList.add('hidden');
+    loadBtn.disabled = false;
+  }
+}
+
+// ── Render D3 force graph ──────────────────────────────────────────
+function renderGraph(data) {
+  const W = document.getElementById('canvas').clientWidth;
+  const H = document.getElementById('canvas').clientHeight;
+
+  svg.selectAll('*').remove();
+
+  // Defs: arrowheads per edge type
+  const defs = svg.append('defs');
+  Object.entries(edgeColor).forEach(([type, color]) => {
+    defs.append('marker')
+      .attr('id', `arrow-${type}`)
+      .attr('viewBox', '0 -4 8 8')
+      .attr('refX', 18).attr('refY', 0)
+      .attr('markerWidth', 5).attr('markerHeight', 5)
+      .attr('orient', 'auto')
+      .append('path')
+        .attr('d', 'M0,-4L8,0L0,4')
+        .attr('fill', color);
+  });
+
+  // Zoom layer
+  const g = svg.append('g');
+  svg.call(d3.zoom()
+    .scaleExtent([.1, 5])
+    .on('zoom', e => g.attr('transform', e.transform))
+  );
+
+  // Deep-clone nodes/links (D3 mutates them)
+  const nodes = data.nodes.map(d => ({ ...d }));
+  const links = data.edges.map(d => ({ ...d, source: d.from, target: d.to }));
+
+  // Simulation
+  if (simulation) simulation.stop();
+  simulation = d3.forceSimulation(nodes)
+    .force('link',   d3.forceLink(links).id(d => d.id).distance(d => d.type === 'contains' ? 60 : 120).strength(.5))
+    .force('charge', d3.forceManyBody().strength(-220))
+    .force('center', d3.forceCenter(W / 2, H / 2))
+    .force('collide', d3.forceCollide(d => nodeRadius[d.type] + 6));
+
+  // Links
+  const link = g.append('g').selectAll('line')
+    .data(links)
+    .join('line')
+      .attr('class', 'link')
+      .attr('stroke', d => edgeColor[d.type] || '#555')
+      .attr('marker-end', d => `url(#arrow-${d.type})`)
+      .classed('hidden', d => !visible[`edge-${d.type}`]);
+
+  // Node groups
+  const node = g.append('g').selectAll('g')
+    .data(nodes)
+    .join('g')
+      .attr('class', 'node')
+      .classed('hidden', d => !visible[`node-${d.type}`])
+      .call(d3.drag()
+        .on('start', (e, d) => { if (!e.active) simulation.alphaTarget(.3).restart(); d.fx = d.x; d.fy = d.y; })
+        .on('drag',  (e, d) => { d.fx = e.x; d.fy = e.y; })
+        .on('end',   (e, d) => { if (!e.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; })
+      )
+      .on('click', (e, d) => { e.stopPropagation(); showInfo(d, links); });
+
+  node.append('circle')
+    .attr('r', d => nodeRadius[d.type] || 5)
+    .attr('fill', d => nodeColor[d.type] || '#888')
+    .attr('stroke', d => d3.color(nodeColor[d.type] || '#888').brighter(1));
+
+  node.append('text')
+    .attr('dy', d => (nodeRadius[d.type] || 5) + 10)
+    .text(d => {
+      const label = d.name || d.id.split('::').pop();
+      return label.length > 20 ? label.slice(0, 18) + '…' : label;
+    });
+
+  // Tick
+  simulation.on('tick', () => {
+    link
+      .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+    node.attr('transform', d => `translate(${d.x},${d.y})`);
+  });
+
+  // Click background → close panel
+  svg.on('click', () => infoEl.classList.remove('visible'));
+}
+
+// ── Info panel ─────────────────────────────────────────────────────
+function showInfo(d, links) {
+  infoTitle.textContent = d.id;
+
+  const callers  = links.filter(l => (l.target.id || l.target) === d.id && l.type === 'calls').map(l => l.source.id || l.source);
+  const callees  = links.filter(l => (l.source.id || l.source) === d.id && l.type === 'calls').map(l => l.target.id || l.target);
+  const inherits = links.filter(l => (l.source.id || l.source) === d.id && l.type === 'inherits').map(l => l.target.id || l.target);
+  const children = links.filter(l => (l.source.id || l.source) === d.id && l.type === 'contains').map(l => l.target.id || l.target);
+
+  let html = `
+    <div class="row"><span class="key">type</span><span class="val" style="color:${nodeColor[d.type]}">${d.type}</span></div>
+    <div class="row"><span class="key">module</span><span class="val">${d.module || '—'}</span></div>
+    ${d.lineno ? `<div class="row"><span class="key">line</span><span class="val">${d.lineno}</span></div>` : ''}
+    ${d.class_name ? `<div class="row"><span class="key">class</span><span class="val">${d.class_name}</span></div>` : ''}
+  `;
+
+  if (inherits.length) html += section('inherits', inherits);
+  if (children.length) html += section('contains', children);
+  if (callees.length)  html += section('calls', callees);
+  if (callers.length)  html += section('called by', callers);
+
+  infoBody.innerHTML = html;
+  infoEl.classList.add('visible');
+}
+
+function section(title, items) {
+  return `<div class="section">${title} (${items.length})</div>
+    <ul>${items.map(i => `<li>${i.split('::').pop()} <span style="color:var(--muted);font-size:.6rem">${i}</span></li>`).join('')}</ul>`;
+}
+
+// ── Filters ────────────────────────────────────────────────────────
+document.querySelectorAll('.pill').forEach(pill => {
+  pill.addEventListener('click', () => {
+    const key = pill.dataset.filter;
+    visible[key] = !visible[key];
+    pill.classList.toggle('off', !visible[key]);
+    applyFilters();
+  });
+});
+
+function applyFilters() {
+  d3.selectAll('.node').classed('hidden', d => !visible[`node-${d.type}`]);
+  d3.selectAll('.link').classed('hidden', d => !visible[`edge-${d.type}`]);
+}
+
+// ── Stats ──────────────────────────────────────────────────────────
+function updateStats(data) {
+  const nc = t => data.nodes.filter(n => n.type === t).length;
+  const ec = t => data.edges.filter(e => e.type === t).length;
+  statsEl.innerHTML = `
+    <span style="color:var(--module)">■</span> ${nc('module')} modules &nbsp;
+    <span style="color:var(--class)">■</span> ${nc('class')} classes &nbsp;
+    <span style="color:var(--function)">■</span> ${nc('function')} functions<br>
+    <span style="color:var(--calls)">→</span> ${ec('calls')} calls &nbsp;
+    <span style="color:var(--inherits)">→</span> ${ec('inherits')} inherits &nbsp;
+    <span style="color:var(--imports)">→</span> ${ec('imports')} imports &nbsp;
+    <span style="color:var(--muted)">→</span> ${ec('contains')} contains
+  `;
+}
+
+function setStatus(msg) { statusEl.textContent = msg; }
+
+// ── Export PNG ─────────────────────────────────────────────────────
+exportBtn.addEventListener('click', () => {
+  const svgEl  = document.getElementById('svg');
+  const xml    = new XMLSerializer().serializeToString(svgEl);
+  const blob   = new Blob([xml], { type: 'image/svg+xml' });
+  const url    = URL.createObjectURL(blob);
+  const a      = document.createElement('a');
+  a.href = url; a.download = 'graph.svg'; a.click();
+  URL.revokeObjectURL(url);
+});
+
+// ── Info close ─────────────────────────────────────────────────────
+document.getElementById('info-close').addEventListener('click', () => {
+  infoEl.classList.remove('visible');
+});
+
+// ── Load button + Enter ────────────────────────────────────────────
+loadBtn.addEventListener('click', loadGraph);
+pathInput.addEventListener('keydown', e => { if (e.key === 'Enter') loadGraph(); });
+
+// ── Auto-load on open ──────────────────────────────────────────────
+loadGraph();
+</script>
+</body>
+</html>
